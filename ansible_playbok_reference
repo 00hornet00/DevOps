@@ -1,0 +1,99 @@
+---
+- name: Deploy GitLab with Nginx and self-signed SSL
+  hosts: localhost
+  become: yes
+  tasks:
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - nginx
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: Create Docker network for GitLab
+      docker_network:
+        name: gitlab_network
+
+    - name: Run GitLab container without exposed ports
+      docker_container:
+        name: gitlab_container
+        image: gitlab/gitlab-ee:latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: gitlab_network
+        volumes:
+          - /srv/gitlab/config:/etc/gitlab
+          - /srv/gitlab/logs:/var/log/gitlab
+          - /srv/gitlab/data:/var/opt/gitlab
+        env:
+          GITLAB_OMNIBUS_CONFIG: |
+            external_url 'http://gitlab.local'
+
+    - name: Create directory for SSL certificates
+      file:
+        path: /etc/nginx/ssl
+        state: directory
+        mode: '0755'
+
+    - name: Generate a self-signed SSL certificate
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout /etc/nginx/ssl/gitlab-selfsigned.key
+        -out /etc/nginx/ssl/gitlab-selfsigned.crt
+        -subj "/CN=gitlab.local"
+      args:
+        creates: /etc/nginx/ssl/gitlab-selfsigned.crt
+
+    - name: Create Nginx configuration for GitLab
+      copy:
+        dest: /etc/nginx/sites-available/gitlab
+        content: |
+          server {
+              listen 443 ssl;
+              server_name gitlab.local;
+
+              ssl_certificate /etc/nginx/ssl/gitlab-selfsigned.crt;
+              ssl_certificate_key /etc/nginx/ssl/gitlab-selfsigned.key;
+
+              location / {
+                  proxy_pass http://172.18.0.2;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+          server {
+              listen 80;
+              server_name gitlab.local;
+
+              return 301 https://$host$request_uri;
+          }
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/gitlab
+        dest: /etc/nginx/sites-enabled/gitlab
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Add 'gitlab.local' to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.1 gitlab.local"
+        state: present
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
